@@ -7,7 +7,35 @@ import time
 import urllib.parse
 import urllib.request
 
-from scrapling.fetchers import Fetcher, PlayWrightFetcher
+# Resilient import — scrapling has renamed/restructured fetchers across versions
+# and Playwright may not be available on all deployment targets.
+_PLAYWRIGHT_AVAILABLE = False
+try:
+    from scrapling.fetchers import PlayWrightFetcher as _PWFetcher
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    try:
+        from scrapling.fetchers import PlaywrightFetcher as _PWFetcher  # lowercase 'w'
+        _PLAYWRIGHT_AVAILABLE = True
+    except ImportError:
+        _PWFetcher = None
+
+try:
+    from scrapling.fetchers import Fetcher as _StaticFetcher
+except ImportError:
+    _StaticFetcher = None
+
+
+def _make_fetcher():
+    """Return the best available fetcher — Playwright > Fetcher > None."""
+    if _PLAYWRIGHT_AVAILABLE and _PWFetcher:
+        return _PWFetcher()
+    if _StaticFetcher:
+        return _StaticFetcher(auto_match=False)
+    raise RuntimeError(
+        "No scrapling fetcher available — check that scrapling and playwright "
+        "are installed correctly."
+    )
 
 
 _DDG_HEADERS = {
@@ -53,9 +81,15 @@ def scrape_product_page(url: str) -> dict:
 
 def _scrape_page(url: str, attempts: int = 2) -> dict:
     last_error = None
+    fetcher = _make_fetcher()
+    _log(f"[scraper] using fetcher: {fetcher.__class__.__name__}")
     for attempt in range(1, attempts + 1):
         try:
-            response = PlayWrightFetcher().fetch(url, headless=True, stealth=True, timeout=45000)
+            # PlayWrightFetcher supports stealth/headless kwargs; plain Fetcher does not
+            if _PLAYWRIGHT_AVAILABLE:
+                response = fetcher.fetch(url, headless=True, stealth=True, timeout=45000)
+            else:
+                response = fetcher.get(url)
             status = getattr(response, 'status', None)
             html = response.html_content or response.body or ""
             if not html:
