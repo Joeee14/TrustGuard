@@ -1,0 +1,65 @@
+{
+  "expo": {
+    "name": "Trust Guard",
+    "slug": "trust-guard",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#F1F5FA"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.trustguard.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Trust Guard needs camera access to scan product photos and find trusted sellers.",
+        "NSPhotoLibraryUsageDescription": "Trust Guard needs photo library access to analyze product images."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#F1F5FA"
+      },
+      "package": "com.trustguard.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Trust Guard needs camera access to scan product photos."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Trust Guard needs photo library access to analyze product images."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "8f262b03-57b2-4f9a-b47b-35b62ee6d49a"
+      }
+    },
+    "owner": "trustguardgg",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/8f262b03-57b2-4f9a-b47b-35b62ee6d49a"
+    }
+  }
+}
