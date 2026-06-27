@@ -1,6 +1,16 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
+python-dotenv>=1.0.0
+
+# Scrapling and ALL its dependencies listed explicitly to avoid
+# missing-module errors on Render where transitive deps can be skipped
 scrapling
 playwright
 curl_cffi
-python-dotenv>=1.0.0
+browserforge
+tldextract
+lxml
+cssselect
+orjson
+tld
+w3lib
