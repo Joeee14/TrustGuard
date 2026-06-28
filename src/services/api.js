@@ -742,9 +742,6 @@ export async function analyzeUrl(url) {
     result.price = `EGP ${ourPriceEGP.toLocaleString()}`;
   }
 
-  // Real market price range computed from actual competing listings
-  _injectMarketPrice(result, _computeMarketStats(scraped.marketResults));
-
   // ── Real alternatives via Egyptian market search (same pipeline as camera scan)
   // The backend already ran _search_market (Google Egypt) and returned marketResults.
   // If that came back with fewer than 3 priced listings (cold backend, anti-bot block,
@@ -764,6 +761,9 @@ export async function analyzeUrl(url) {
     }
   }
   _injectAlternatives(result, marketData);
+
+  // Real market price range computed from actual competing listings (combined backend + client-side data)
+  _injectMarketPrice(result, _computeMarketStats(marketData));
 
   // ── Last-resort fallback: if BOTH backend and client-side search returned
   // nothing, show Egyptian store search links so the section is never empty.
