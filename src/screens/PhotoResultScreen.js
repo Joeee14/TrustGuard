@@ -16,7 +16,18 @@ import { AlternativeRow } from './ResultScreen';
 import { searchByImage } from '../services/api';
 import { cardShadow } from '../theme';
 
-const FILTER_STORES = ['All sellers', 'Amazon.eg', 'Noon', 'Jumia', 'B.TECH', '2B Egypt', 'Carrefour'];
+const FILTER_STORES = [
+  'All sellers',
+  'Amazon.eg',
+  'Noon Egypt',
+  'Jumia Egypt',
+  'B.TECH',
+  '2B Egypt',
+  'LC Waikiki Egypt',
+  'Namshi Egypt',
+  'El Ezaby',
+  'Carrefour Egypt',
+];
 
 export default function PhotoResultScreen({ navigation, route }) {
   const { t } = useApp();
@@ -38,11 +49,17 @@ export default function PhotoResultScreen({ navigation, route }) {
       });
   }, [imageUri]);
 
+  // Build filter chips dynamically from whatever stores appear in results
+  const filterStores = result
+    ? ['All sellers', ...new Set(result.matches.map((m) => m.store).filter(Boolean))]
+    : ['All sellers'];
+
   const filteredMatches = result
     ? activeFilter === 'All sellers'
       ? result.matches
       : result.matches.filter((m) => m.store === activeFilter)
     : [];
+
 
   if (loading) {
     return (
@@ -173,7 +190,7 @@ export default function PhotoResultScreen({ navigation, route }) {
           contentContainerStyle={styles.filterRow}
           style={{ paddingBottom: 4 }}
         >
-          {FILTER_STORES.map((f) => (
+          {filterStores.map((f) => (
             <TouchableOpacity
               key={f}
               onPress={() => setActiveFilter(f)}

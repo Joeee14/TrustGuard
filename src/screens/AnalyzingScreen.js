@@ -74,29 +74,65 @@ export default function AnalyzingScreen({ navigation, route }) {
 
   useEffect(() => {
     let didCancel = false;
+    let currentStep = 0;
+    let apiResult = null;
+    let apiError = null;
+    let apiFinished = false;
+
+    // Trigger API request immediately
+    analyzeUrl(url)
+      .then((res) => {
+        apiResult = res;
+        apiFinished = true;
+      })
+      .catch((err) => {
+        apiError = err;
+        apiFinished = true;
+      });
 
     async function runAnalysis() {
-      for (let i = 0; i <= SCAN_STEPS.length; i++) {
+      // Loop until we pass the last step of the progress indicators
+      while (currentStep <= SCAN_STEPS.length) {
         if (didCancel) return;
-        setStep(i);
-        await new Promise((r) => setTimeout(r, STEP_DURATION));
-      }
-      if (didCancel) return;
-      try {
-        const result = await analyzeUrl(url);
-        if (!didCancel) navigation.replace('Result', { result });
-      } catch (err) {
-        console.error('[TrustGuard] Analysis error:', err.message);
-        if (!didCancel) {
-          Alert.alert('Analysis failed', err.message, [
-            { text: 'OK', onPress: () => navigation.navigate('Home') },
-          ]);
+
+        // If we reached the final complete state
+        if (currentStep === SCAN_STEPS.length) {
+          if (apiFinished) {
+            if (apiError) {
+              console.error('[TrustGuard] Analysis error:', apiError.message);
+              if (!didCancel) {
+                Alert.alert('Analysis failed', apiError.message, [
+                  { text: 'OK', onPress: () => navigation.navigate('Home') },
+                ]);
+              }
+            } else if (apiResult) {
+              if (!didCancel) {
+                navigation.replace('Result', { result: apiResult });
+              }
+            }
+            return;
+          } else {
+            // API is still loading. Pause at the second-to-last step (Computing Trust Score...)
+            setStep(SCAN_STEPS.length - 1);
+            await new Promise((r) => setTimeout(r, 300));
+            continue;
+          }
         }
+
+        setStep(currentStep);
+
+        // If API is already done, fast-forward through the remaining steps.
+        // Otherwise, step slowly (2.2s per step) to align with actual load times.
+        const delay = apiFinished ? 150 : 2200;
+        await new Promise((r) => setTimeout(r, delay));
+        currentStep++;
       }
     }
 
     runAnalysis();
-    return () => { didCancel = true; };
+    return () => {
+      didCancel = true;
+    };
   }, [url]);
 
   return (

@@ -129,6 +129,11 @@ export function TrustShieldBadge({ score, t, size = 168 }) {
   const fillY = 100 - score;
   const textColor = score > 50 ? '#FFFFFF' : t.text;
 
+  // Dynamically scale text sizes based on badge size to prevent overflows
+  const scoreFontSize = size * 0.26;
+  const labelFontSize = Math.max(8, size * 0.085);
+  const scoreLineHeight = size * 0.3;
+
   return (
     <View style={{ width: size, height: size }}>
       <Svg width={size} height={size} viewBox="0 0 100 100">
@@ -151,12 +156,13 @@ export function TrustShieldBadge({ score, t, size = 168 }) {
           strokeWidth="2.5"
         />
       </Svg>
-      <View style={[StyleSheet.absoluteFillObject, styles.ringCenter]}>
-        <Text style={[styles.shieldScore, { color: textColor, fontSize: size * 0.28 }]}>
+      {/* Shift text slightly upwards (paddingBottom) to place it in the wider top-half of the shield */}
+      <View style={[StyleSheet.absoluteFillObject, styles.ringCenter, { paddingBottom: size * 0.08 }]}>
+        <Text style={[styles.shieldScore, { color: textColor, fontSize: scoreFontSize, lineHeight: scoreLineHeight }]}>
           {score}
-          <Text style={{ fontSize: size * 0.13, opacity: 0.8 }}>%</Text>
+          <Text style={{ fontSize: scoreFontSize * 0.5, opacity: 0.8 }}>%</Text>
         </Text>
-        <Text style={[styles.shieldLabel, { color: textColor }]}>
+        <Text style={[styles.shieldLabel, { color: textColor, fontSize: labelFontSize }]}>
           {tierLabel(score)}
         </Text>
       </View>

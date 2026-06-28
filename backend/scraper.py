@@ -113,7 +113,15 @@ def _scrape_page(url: str, attempts: int = 2) -> dict:
     raise RuntimeError(f"Failed to scrape {url}: {last_error}")
 
 
-# ── Social review search via DuckDuckGo ───────────────────────────────────────
+# ── Review search via SerpAPI (primary) or DuckDuckGo (fallback) ────────────
+#
+# The old DDG-based approach had two problems:
+#   1. It used `Fetcher` instead of `_StaticFetcher` — NameError on every call.
+#   2. DDG snippets are page descriptions, not customer quotes, so the LLM had
+#      nothing real to quote and fabricated feedback.
+#
+# The SerpAPI approach searches Google Egypt specifically for customer review
+# pages (Amazon.eg, Jumia, etc.) where snippets contain actual customer quote text.
 
 def _build_query(url: str, page: dict) -> str:
     # Prefer og_title (e.g. "Cotton Sweatpants H&M Egypt"), fall back to domain
@@ -132,22 +140,91 @@ def _build_query(url: str, page: dict) -> str:
 
 
 def _search_reviews(product: str) -> list:
+    """Return a list of {title, snippet} dicts from real review pages.
+    Tries SerpAPI first (more reliable, real review sources), falls back
+    to DuckDuckGo if SERPAPI_KEY is absent.
+    """
+    if SERPAPI_KEY:
+        return _search_reviews_serpapi(product)
+    return _search_reviews_ddg(product)
+
+
+def _search_reviews_serpapi(product: str) -> list:
+    """Search Google Egypt for customer reviews of the product via SerpAPI.
+    Targets review-rich sources (Amazon.eg, Jumia, Noon) so the returned
+    snippets contain actual customer quote text, not marketing copy."""
+    try:
+        # Two complementary queries:
+        # 1. Merchant-site reviews — snippets from product review sections
+        # 2. Arabic review query  — catches Egyptian-language reviews
+        queries = [
+            f'{product} site:amazon.eg OR site:jumia.com.eg OR site:noon.com customer reviews',
+            f'{product} تقييمات عملاء',
+        ]
+        results = []
+        seen_snippets: set = set()
+
+        for q in queries:
+            if len(results) >= 8:
+                break
+            qs = urllib.parse.urlencode({
+                'engine':        'google',
+                'q':             q,
+                'gl':            'eg',
+                'hl':            'en',
+                'google_domain': 'google.com.eg',
+                'api_key':       SERPAPI_KEY,
+                'num':           '10',
+            })
+            req = urllib.request.Request(
+                f'{SERPAPI_URL}?{qs}',
+                headers={'User-Agent': _DDG_HEADERS['User-Agent']},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode('utf-8', errors='replace'))
+
+            for item in data.get('organic_results', []):
+                snippet = (item.get('snippet') or '').strip()
+                title   = (item.get('title')   or '').strip()
+                if not snippet or len(snippet) < 20:
+                    continue
+                # Deduplicate: skip near-identical snippets
+                key = snippet[:60].lower()
+                if key in seen_snippets:
+                    continue
+                seen_snippets.add(key)
+                results.append({'title': title, 'snippet': snippet})
+                if len(results) >= 8:
+                    break
+
+        _log(f"[scraper] SerpAPI reviews for '{product[:50]}' -> {len(results)} snippets")
+        return results
+
+    except Exception as e:
+        _log(f"[scraper] SerpAPI review search failed: {e}")
+        return []
+
+
+def _search_reviews_ddg(product: str) -> list:
+    """DuckDuckGo fallback for when SERPAPI_KEY is not set.
+    Fixed: uses _StaticFetcher (not the undefined bare 'Fetcher')."""
+    if not _StaticFetcher:
+        _log("[scraper] _StaticFetcher not available — skipping DDG review search")
+        return []
     try:
         query = f'"{product}" reviews customers'
         encoded = urllib.parse.quote(query)
-        response = Fetcher(auto_match=False).get(
+        response = _StaticFetcher(auto_match=False).get(
             f'https://html.duckduckgo.com/html/?q={encoded}',
             headers=_DDG_HEADERS,
         )
         if not response or response.status != 200:
-            _log(f"[scraper] DDG failed status={getattr(response,'status','?')}")
+            _log(f"[scraper] DDG failed status={getattr(response, 'status', '?')}")
             return []
 
         results = []
-        # Title + snippet for each organic result
         titles   = response.css('.result__title')
         snippets = response.css('.result__snippet')
-
         for i, snippet in enumerate(snippets[:8]):
             title_text = titles[i].get_all_text().strip() if i < len(titles) else ''
             snip_text  = snippet.get_all_text().strip()
@@ -424,12 +501,15 @@ def _best_price_from_snippet(text: str):
 
 
 _SELLER_NAME_PATTERNS = [
-    # The optional ".xx" suffix lets names like "Amazon.eg" capture in full —
-    # without it, the [^.] in the main group stops right at the period.
     r'Ships from and sold by\s+([^.\n<]{2,40}(?:\.[a-z]{2,3})?)',
     r'Sold by\s+([^.\n<]{2,40}(?:\.[a-z]{2,3})?)',
+    r'Sold by:\s*([^.\n<]{2,40})',
     r'Seller\s+name:?\s*([^.\n<]{2,40}(?:\.[a-z]{2,3})?)',
     r'يباع من قبل\s*([^.\n<]{2,40})',
+    r'يباع بواسطة\s*([^.\n<]{2,40})',
+    r'التاجر:?\s*([^.\n<]{2,40})',
+    r'Merchant:?\s*([^.\n<]{2,40})',
+    r'Brand:?\s*([^.\n<]{2,40})',
 ]
 _SELLER_RATING_PATTERNS = [
     r'\d{1,3}%\s*(?:positive|good)',
@@ -450,8 +530,10 @@ def _looks_like_seller_name(name: str) -> bool:
     return not any(stop in lowered for stop in _SELLER_STOPWORDS)
 
 
-def _extract_seller(plain: str, structured_data: list):
-    """Real seller info only — returns None if nothing is disclosed on the page."""
+def _extract_seller(html: str, plain: str, structured_data: list):
+    """Real seller info only — returns None if nothing is disclosed on the page.
+    Utilizes raw HTML buybox targets as well as plain text patterns."""
+    # ── 1. Parse from JSON-LD (seller & brand fallbacks) ──
     for ld in structured_data:
         for node in _ld_nodes(ld):
             offers = _offers_of(node)
@@ -460,7 +542,56 @@ def _extract_seller(plain: str, structured_data: list):
                 name = (seller.get('name') or '').strip()
                 if name and _looks_like_seller_name(name):
                     return {'name': name, 'ratingText': ''}
+            
+            # Fallback to brand in JSON-LD if present
+            brand = node.get('brand')
+            if isinstance(brand, dict):
+                brand = brand.get('name') or ''
+            if isinstance(brand, str) and brand:
+                brand_name = brand.strip()
+                if brand_name and _looks_like_seller_name(brand_name):
+                    return {'name': brand_name, 'ratingText': ''}
 
+    # ── 2. Amazon Specific DOM Elements (direct regex on HTML) ──
+    # Amazon seller profile trigger ID link (best source of truth for third-party sellers)
+    m = re.search(r'id=["\']sellerProfileTriggerId["\'][^>]*>\s*([^<\n]+?)\s*</a>', html, re.IGNORECASE)
+    if m:
+        name = html_lib.unescape(m.group(1)).strip()
+        if name and _looks_like_seller_name(name):
+            return {'name': name, 'ratingText': ''}
+
+    # Tabular buy box seller message (e.g. data-field="seller")
+    m = re.search(
+        r'data-field=["\']seller["\'][\s\S]{0,400}?class=["\'][^"\']*tabular-buybox-text-message[^"\']*["\'][^>]*>\s*([^<\n]+?)\s*</span>',
+        html, re.IGNORECASE
+    )
+    if m:
+        name = html_lib.unescape(m.group(1)).strip()
+        if name and _looks_like_seller_name(name):
+            return {'name': name, 'ratingText': ''}
+
+    # merchant-info div (standard Amazon seller details)
+    m = re.search(r'id=["\']merchant-info["\'][^>]*>\s*([\s\S]+?)\s*</div>', html, re.IGNORECASE)
+    if m:
+        chunk = html_lib.unescape(m.group(1)).strip()
+        chunk = re.sub(r'<[^>]+>', ' ', chunk)
+        chunk = re.sub(r'\s+', ' ', chunk).strip()
+        for pattern in _SELLER_NAME_PATTERNS:
+            sm = re.search(pattern, chunk, re.IGNORECASE)
+            if sm:
+                name = sm.group(1).strip().rstrip(',.')
+                if name and _looks_like_seller_name(name):
+                    return {'name': name, 'ratingText': ''}
+
+    # Brand byline/Store link (e.g., "Visit the Apple Store" or "Brand: Apple")
+    m = re.search(r'id=["\']bylineInfo["\'][^>]*>\s*(?:Brand:\s*|Visit the\s*)?([^<\n]+?)(?:\s*Store)?\s*</a>', html, re.IGNORECASE) or \
+        re.search(r'class=["\'][^"\']*bylineInfo[^"\']*["\'][^>]*>\s*(?:Brand:\s*|Visit the\s*)?([^<\n]+?)(?:\s*Store)?\s*</a>', html, re.IGNORECASE)
+    if m:
+        name = html_lib.unescape(m.group(1)).strip()
+        if name and _looks_like_seller_name(name):
+            return {'name': name, 'ratingText': ''}
+
+    # ── 3. General Plain Text Patterns ──
     for pattern in _SELLER_NAME_PATTERNS:
         m = re.search(pattern, plain, re.IGNORECASE)
         if not m:
@@ -468,9 +599,7 @@ def _extract_seller(plain: str, structured_data: list):
         name = m.group(1).strip().rstrip(',.')
         if len(name) < 2 or not _looks_like_seller_name(name):
             continue
-        # Only look for a rating in the text immediately around this specific
-        # seller mention — searching the whole page risks picking up an
-        # unrelated "X% positive" from a totally different widget.
+        # Extract ratings near the seller mention
         nearby = plain[m.start():m.end() + 150]
         rating_text = ''
         for rp in _SELLER_RATING_PATTERNS:
@@ -485,43 +614,66 @@ def _extract_seller(plain: str, structured_data: list):
 
 def _extract_page_reviews(html: str, plain_full: str) -> list:
     """Extract actual customer review text written on the product page itself.
-    Targets Amazon.eg review widgets and generic review/testimonial patterns.
+    Four methods tried in priority order; stops as soon as one yields results.
     Returns a list of dicts with 'title' and 'snippet' keys."""
     reviews = []
 
-    # ── Amazon.eg review blocks ───────────────────────────────────────────────
-    # Amazon renders review titles in .review-title and bodies in .review-text
-    # These appear in the HTML even with JS-rendering via Playwright.
-    review_title_pattern = re.compile(
-        r'<span[^>]+class=["\'][^"\']*(review-title)[^"\'][^>]*>\s*(<span[^>]*>[^<]*</span>)?\s*([^<]{3,200})\s*</span>',
+    # ── Method 1: Amazon data-hook attributes (highest reliability) ───────────
+    # Amazon consistently marks real review bodies with data-hook="review-body"
+    # and titles with data-hook="review-title". These survive JS rendering.
+    dh_body_re  = re.compile(
+        r'data-hook=["\']review-body["\'][^>]*>[\s\S]{0,400}?<span[^>]*>([\s\S]{20,2000}?)</span>',
         re.IGNORECASE,
     )
-    review_body_pattern = re.compile(
-        r'<span[^>]+class=["\'][^"\']*(review-text-content|reviewText)[^"\'][^>]*>[\s\S]{0,50}<span[^>]*>([^<]{20,1000})</span>',
+    dh_title_re = re.compile(
+        r'data-hook=["\']review-title["\'][^>]*>[\s\S]{0,300}?<span[^>]*>([^<]{3,200})</span>',
         re.IGNORECASE,
     )
 
-    titles = [html_lib.unescape(m.group(3)).strip() for m in review_title_pattern.finditer(html)]
-    bodies = [html_lib.unescape(m.group(2)).strip() for m in review_body_pattern.finditer(html)]
+    bodies = [html_lib.unescape(m.group(1)).strip() for m in dh_body_re.finditer(html)]
+    titles = [html_lib.unescape(m.group(1)).strip() for m in dh_title_re.finditer(html)]
 
     for i, body in enumerate(bodies[:6]):
+        body = re.sub(r'\s+', ' ', body).strip()
         if len(body) < 20:
             continue
         title = titles[i] if i < len(titles) else ''
         reviews.append({'title': title, 'snippet': body})
 
     if reviews:
-        _log(f"[scraper] on-page reviews extracted: {len(reviews)}")
+        _log(f"[scraper] on-page reviews (data-hook): {len(reviews)}")
         return reviews
 
-    # ── Generic fallback: look for review/testimonial JSON in page scripts ───
-    # Some sites embed reviews as JSON arrays in script tags
+    # ── Method 2: Amazon CSS class selectors ─────────────────────────────────
+    # Fixed: original regex had `[^"\'"]` (extra quote) causing wrong match.
+    review_title_re = re.compile(
+        r'<span[^>]+class=["\'][^"\']*(review-title)[^"\']*[^>]*>\s*(?:<span[^>]*>[^<]*</span>)?\s*([^<]{3,200})\s*</span>',
+        re.IGNORECASE,
+    )
+    review_body_re = re.compile(
+        r'<span[^>]+class=["\'][^"\']*(review-text-content|reviewText)[^"\']*[^>]*>[\s\S]{0,80}<span[^>]*>([^<]{20,1000})</span>',
+        re.IGNORECASE,
+    )
+
+    css_titles = [html_lib.unescape(m.group(2)).strip() for m in review_title_re.finditer(html)]
+    css_bodies = [html_lib.unescape(m.group(2)).strip() for m in review_body_re.finditer(html)]
+
+    for i, body in enumerate(css_bodies[:6]):
+        if len(body) < 20:
+            continue
+        title = css_titles[i] if i < len(css_titles) else ''
+        reviews.append({'title': title, 'snippet': body})
+
+    if reviews:
+        _log(f"[scraper] on-page reviews (CSS class): {len(reviews)}")
+        return reviews
+
+    # ── Method 3: JSON-embedded review arrays ─────────────────────────────────
     for m in re.finditer(
         r'(?:"reviews?"\s*:\s*\[|"testimonials?"\s*:\s*\[)([\s\S]{0,4000}?)\]',
         html, re.IGNORECASE,
     ):
         chunk = m.group(0)
-        # Pull out "body"/"text"/"content" strings from this JSON chunk
         for tm in re.finditer(
             r'"(?:body|text|content|comment|description)"\s*:\s*"([^"]{20,500})"',
             chunk,
@@ -531,23 +683,54 @@ def _extract_page_reviews(html: str, plain_full: str) -> list:
                 reviews.append({'title': '', 'snippet': snippet})
 
     if reviews:
-        _log(f"[scraper] on-page reviews (JSON fallback): {len(reviews)}")
+        _log(f"[scraper] on-page reviews (JSON): {len(reviews)}")
         return reviews
 
-    # ── Generic plain-text fallback: sentences near star/rating mentions ─────
-    # e.g. "5 stars — Great product, very fast delivery. I recommend it."
+    # ── Method 4: Star-sentence fallback — STRICT filtering ───────────────────
+    # The broad regex catches false positives on Amazon (carousels, sponsored
+    # items, navigation all contain star ratings). Only keep sentences that
+    # pass every check below.
+    _GARBAGE_RE = re.compile(
+        r'^[a-z]'                         # truncated word at start ("t over")
+        r'|Previous\s+(set|page)\s+of'   # carousel navigation
+        r'|Next\s+(set|page)\s+of'
+        r'|Sponsored\s+Products'
+        r'|Prime\s+Day'
+        r'|Tax\s+Paid'
+        r'|Official\s+Warranty\s+\d'
+        r'|EGP\s*[\d,]+'                 # starts with a price
+        r'|\|\s*(Tax|Warranty|Free)',
+        re.IGNORECASE,
+    )
+    _OPINION_RE = re.compile(
+        r'\b(great|good|excellent|perfect|amazing|love|like|recommend|quality|fast|'
+        r'quick|slow|bad|poor|terrible|awful|disappoint|happy|satisf|worth|value|'
+        r'easy|difficult|durable|light|heavy|thin|thick|beautiful|nice|'
+        r'ممتاز|جيد|سيء|رائع|أوصي|جودة|سريع|بطيء|راضي|منتج|تجربة)\b',
+        re.IGNORECASE,
+    )
     for m in re.finditer(
-        r'(?:[1-5](?:\.\d)?\s*(?:stars?|نجوم|نجمة))\s*[—\-–:]?\s*([^.!?]{20,300}[.!?])',
+        r'(?:[1-5](?:\.\d)?\s*(?:stars?|نجوم|نجمة))\s*[—\-–:]?\s*([^.!?\n]{20,300}[.!?])',
         plain_full, re.IGNORECASE,
     ):
         snippet = m.group(1).strip()
-        if snippet and len(reviews) < 5:
-            reviews.append({'title': '', 'snippet': snippet})
+        if not snippet:
+            continue
+        if _GARBAGE_RE.search(snippet):
+            continue
+        if not _OPINION_RE.search(snippet):
+            continue
+        if len(snippet.split()) < 4:
+            continue
+        reviews.append({'title': '', 'snippet': snippet})
+        if len(reviews) >= 5:
+            break
 
     if reviews:
         _log(f"[scraper] on-page reviews (star-sentence fallback): {len(reviews)}")
 
     return reviews
+
 
 
 def _parse_page(html: str) -> dict:
@@ -677,7 +860,7 @@ def _parse_page(html: str) -> dict:
             if og_image:
                 break
 
-    seller_info = _extract_seller(plain_full, structured_data)
+    seller_info = _extract_seller(html, plain_full, structured_data)
     plain = plain_full[:4000]
 
     # ── Aggregate rating (continued) — JSON-LD beats the combined anchor;

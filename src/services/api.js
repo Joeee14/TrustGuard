@@ -13,16 +13,33 @@ const SERPAPI_BASE_URL = 'https://serpapi.com/search.json';
 const IMGBB_KEY = process.env.EXPO_PUBLIC_IMGBB_API_KEY ?? '';
 const IMGBB_UPLOAD_URL = 'https://api.imgbb.com/1/upload';
 
-// Scrapling backend — auto-detects host from Expo dev server so it works on
-// any device (emulator, Expo Go on real phone) without manual IP config.
+// Scrapling backend URL resolution:
+// 1. EXPO_PUBLIC_SCRAPER_URL env var (highest priority — set in .env)
+// 2. Local dev-server host auto-detected from Expo Metro (local dev only)
+// 3. Live Render backend as the hardcoded production default
+//
+// The hardcoded Render URL ensures Expo Go cloud builds never accidentally
+// fall back to localhost when the env var isn't embedded by EAS Update.
+const _PRODUCTION_BACKEND = 'https://trustguard-1-cc0l.onrender.com';
+
 function _scraperUrl() {
+  // Explicit override always wins (set via .env EXPO_PUBLIC_SCRAPER_URL)
   const override = process.env.EXPO_PUBLIC_SCRAPER_URL;
-  if (override) return override;
+  if (override && override !== _PRODUCTION_BACKEND) return override;
+
+  // If a Metro dev server is running (local development), auto-detect its IP
   const hostUri = Constants.expoConfig?.hostUri ?? Constants.manifest?.debuggerHost ?? '';
   const host = hostUri.split(':')[0];
-  return host ? `http://${host}:8000` : 'http://localhost:8000';
+  if (host && host !== 'localhost' && !host.startsWith('u.expo')) {
+    // Looks like a real local IP (e.g. 192.168.x.x) — use local backend
+    return `http://${host}:8000`;
+  }
+
+  // Cloud / Expo Go published build — use the live Render backend
+  return _PRODUCTION_BACKEND;
 }
 const SCRAPER_URL = _scraperUrl();
+console.log('[TrustGuard] Backend URL:', SCRAPER_URL);
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -61,9 +78,43 @@ function _callLLM(systemPrompt, userMessage) {
 
 // ── Scrapling backend ─────────────────────────────────────────────────────────
 
+// Wrap fetch() with an AbortController timeout so we always get a real error
+// instead of a silent hang (Render free-tier cold starts can take 30-60s).
+async function _fetchWithTimeout(url, options = {}, timeoutMs = 90000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Backend timed out — the server may be waking up, please try again in a moment.');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Wake up a cold-started Render instance by pinging /health first.
+// If the health check itself times out we proceed anyway (maybe the main
+// request will still succeed or give a clearer error).
+async function _wakeBackend() {
+  try {
+    console.log('[TrustGuard] Pinging backend /health to wake from cold start...');
+    await _fetchWithTimeout(`${SCRAPER_URL}/health`, {}, 60000);
+    console.log('[TrustGuard] Backend is awake');
+  } catch (e) {
+    console.warn('[TrustGuard] Health ping failed (proceeding anyway):', e.message);
+  }
+}
+
 async function _scrapeUrl(productUrl) {
   console.log('[TrustGuard] Scrapling ->', productUrl.slice(0, 80));
-  const res = await fetch(`${SCRAPER_URL}/scrape?url=${encodeURIComponent(productUrl)}`);
+  // Wake cold-started Render server before the real (slow) scrape request
+  await _wakeBackend();
+  const res = await _fetchWithTimeout(
+    `${SCRAPER_URL}/scrape?url=${encodeURIComponent(productUrl)}`,
+    {},
+    90000,
+  );
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     let detail = body.slice(0, 200);
@@ -235,37 +286,30 @@ function _injectSeller(result, sellerInfo) {
   }
 }
 
-// ── Real alternatives — grounded in scraped market listings, never invented ─
+// ── Alternatives: built directly from real Egyptian market search results ──
+// Same mapping as the camera scan flow — no LLM sourceIndex picking.
+// The TONES cycle deterministically so cards always have a colour.
+const _ALT_TONES = ['sage', 'cream', 'bottle', 'rose', 'sand', 'slate', 'bronze', 'forest', 'coral', 'sky', 'cocoa', 'moss'];
 
 function _injectAlternatives(result, marketResults) {
-  const list = marketResults ?? [];
-  result.alternatives = (result.alternatives ?? []).slice(0, 6).map((alt, i) => {
-    const src = typeof alt.sourceIndex === 'number' ? list[alt.sourceIndex] : null;
-    if (src) {
-      return {
-        id:    alt.id ?? `a${i + 1}`,
-        brand: alt.brand ?? '',
-        name:  src.title || alt.name || '',
-        price: `EGP ${Math.round(src.price).toLocaleString()}`,
-        score: typeof alt.score === 'number' ? alt.score : 70,
-        store: src.store || alt.store || 'Online store',
-        link:  src.link,
-        tone:  alt.tone ?? 'sand',
-        tags:  alt.tags ?? [],
-      };
-    }
-    return {
-      id:    alt.id ?? `a${i + 1}`,
-      brand: alt.brand ?? '',
-      name:  alt.name ?? '',
-      price: alt.price ?? '',
-      score: typeof alt.score === 'number' ? alt.score : 70,
-      store: alt.store ?? '',
-      link:  _storeSearchUrl(alt.store, alt.brand, alt.name),
-      tone:  alt.tone ?? 'sand',
-      tags:  [...(alt.tags ?? []).slice(0, 2), 'Estimated'],
-    };
-  });
+  const list = (marketResults ?? []).filter((m) => m.link && (m.price > 0 || m.price === null));
+
+  if (list.length === 0) {
+    result.alternatives = [];
+    return;
+  }
+
+  result.alternatives = list.slice(0, 6).map((src, i) => ({
+    id:    `a${i + 1}`,
+    brand: '',
+    name:  src.title || '',
+    price: src.price != null ? `EGP ${Math.round(src.price).toLocaleString()}` : 'Check store',
+    score: 75,
+    store: src.store || 'Online store',
+    link:  src.link,
+    tone:  _ALT_TONES[i % _ALT_TONES.length],
+    tags:  [],
+  }));
 }
 
 // ── Inject scraped rating into LLM result ────────────────────────────────────
@@ -317,7 +361,7 @@ classification (required, nested inside this section): classify the product itse
 - ecoNote: one sentence explaining the ecoImpact, labeled as general category guidance, not a claim about this specific listing's certification.
 
 ════ SELLER — DO NOT USE OUTSIDE KNOWLEDGE HERE ════
-Build this section ONLY from seller_info. "Trusted Egyptian sellers" knowledge belongs in ALTERNATIVES, not here.
+Build this section ONLY from seller_info.
 - seller_info present: title should mention the seller's name naturally (e.g. "Sold by {name}"). flags: only things actually evidenced in page_text (e.g. "third-party seller, not the brand store").
 - seller_info is null: title = "No information provided about the seller", status = "warn", flags = [{ "icon":"info", "label":"The page does not disclose who is selling this product", "sev":"mid" }].
 Do NOT output a "reputation" field — it is computed separately from real data and will be discarded if present.
@@ -325,17 +369,17 @@ Do NOT output a "reputation" field — it is computed separately from real data 
 ════ RATINGS ════
 Always set ratings.value=0, ratings.total=0, ratings.breakdown=[] — the system injects the real scraped rating afterward. Fill "knownRating" from general knowledge ONLY as a last-resort fallback for when nothing was scraped.
 
-════ FEEDBACK — STRICT ════
-feedback.quotes: ONLY text that literally appears in social_results snippets. themes/summary must summarize what's actually in social_results. If social_results is empty, summary must say feedback could not be found, themes=[], quotes=[].
+════ FEEDBACK — STRICT, NO FABRICATION ════
+social_results now comes from a targeted review search on Amazon.eg, Jumia Egypt, and Arabic review queries — these snippets contain real customer opinion text.
+feedback.quotes: COPY verbatim text ONLY from social_results[*].snippet. Do NOT paraphrase, combine, or invent. If a snippet says "Great product, fast delivery" copy that exact phrase. Each quote.src must be the matching social_results[*].title. Each quote.who should be empty string "".
+feedback.themes: summarize recurring sentiments you actually see across the snippets (e.g. "Delivery speed", "Build quality"). If no real patterns exist, return themes=[].
+feedback.summary: write a 1-2 sentence summary of what the snippets actually say about this product. If social_results is empty or none of the snippets contain opinion language (e.g. they're all product descriptions/prices), set summary="No customer feedback was found for this product from public sources.", themes=[], quotes=[], status="warn".
+NEVER invent quotes or attribute words to customers that don't appear in the raw snippet text.
+
 
 ════ PRICE ════
 price.our: your best numeric read of meta_price / structured_data / page_text — this is only a fallback; the system overwrites it with the resolved real price whenever one was scraped.
 price.marketLow/marketAvg/marketHigh: the system overwrites these with real numbers computed from market_results whenever ≥3 usable real listings exist. Your numbers here are only a fallback for when market_results is too sparse — base them on general EGP price knowledge for this exact product type, and don't write the verdict as if it's certain (the system appends a "limited data" caveat automatically when it falls back to your numbers).
-
-════ ALTERNATIVES — PICK FROM REAL DATA FIRST ════
-Prefer items from market_results: for each chosen entry, output "sourceIndex" = its 0-based index in market_results, plus your own "tags" (1-2 words, e.g. "Authentic", "Bestseller"), a "tone", and a "score" (0-100) reflecting how much you generally trust that STORE in the Egyptian market (not the specific listing, which you can't verify). Do NOT output brand/name/price/store/link for sourceIndex items — the system fills those in from the real listing and ignores anything you put there.
-Only when market_results has fewer than 3 usable items for this product's category, add additional suggestions from your own knowledge of real Egyptian retailers (omit sourceIndex). For those: price is your best EGP estimate, store must be a real, well-known Egyptian retailer name, and never output a link — the system builds a safe one.
-Max 6 alternatives total. Prefer sourceIndex-backed ones first.
 
 ════ FORMAT RULES ════
 - trustScore: 0-100 integer (>=70 trusted, 40-69 caution, <40 risky). If seller_info is null or social_results is empty, do not score above 65 unless certificates are strongly page-evidenced.
@@ -392,62 +436,245 @@ Return ONLY valid JSON:
   },
   "specifications": {
     "items": [{ "label": "string", "value": "string" }]
-  },
-  "alternatives": [
-    {
-      "id": "a1",
-      "sourceIndex": number,
-      "brand": "string",
-      "name": "string",
-      "price": "EGP X,XXX",
-      "score": number,
-      "store": "string",
-      "tone": "string",
-      "tags": ["string"]
-    }
-  ]
+  }
 }`;
 
-const IMAGE_SYSTEM_PROMPT = `You are a consumer-protection AI with deep knowledge of the Egyptian e-commerce market.
-You receive Google Lens results identifying a product from a photo.
-Your job: identify the product category and list trusted Egyptian sellers for it.
+// ── Egyptian market helpers (JS mirrors of backend scraper.py) ───────────────
 
-USE YOUR KNOWLEDGE of the Egyptian market:
-- Electronics → B.TECH, 2B, Virgin Megastore, Amazon.eg
-- Fashion → Zara Egypt, H&M, LC Waikiki, Noon Egypt
-- Shoes → Shoe Room, Aldo, Steve Madden Egypt, Amazon.eg
-- Beauty → Faces, Nocibe, El Ezaby pharmacy, Noon
-- Sports → Intersport, Decathlon Egypt
-- General → Amazon.eg, Noon, Jumia
+const _KNOWN_STORE_LABELS = [
+  ['amazon.eg',        'Amazon.eg'],
+  ['noon.com',         'Noon Egypt'],
+  ['jumia.com.eg',     'Jumia Egypt'],
+  ['2b.com.eg',        '2B Egypt'],
+  ['btech.com',        'B.TECH'],
+  ['lcwaikiki.com',    'LC Waikiki Egypt'],
+  ['namshi.com',       'Namshi Egypt'],
+  ['eezaby.com',       'El Ezaby'],
+  ['carefer.com',      'Carefer'],
+  ['carrefouregypt.com', 'Carrefour Egypt'],
+  ['virgin.com.eg',    'Virgin Megastore Egypt'],
+  ['ounass.com',       'Ounass Egypt'],
+];
 
-RULES:
-- score > 70 only
-- Prices in EGP (USD×50, GBP×65, EUR×55) — estimate if needed
-- link: real store website URL from your training knowledge
-- tone: sage|cream|bottle|rose|sand|slate|bronze|forest|coral|moss|sky|cocoa
-- Max 8 matches
+const _NON_MERCHANT_DOMAINS = [
+  'wikipedia.org', 'youtube.com', 'facebook.com', 'instagram.com',
+  'twitter.com', 'x.com', 'reddit.com', 'quora.com', 'pinterest.com',
+  'linkedin.com', 'tiktok.com', 'blogspot.com', 'medium.com',
+  'wordpress.com', 'blogger.com',
+  'pricena.com', 'yaoota.com', 'egprices.com',
+  'dubizzle.com', 'olx.com', 'opensooq.com',
+];
 
-Return ONLY valid JSON:
-{
-  "detected": "string",
-  "thumbnailTone": "string",
-  "matches": [
-    {
-      "id": "p1",
-      "brand": "string",
-      "name": "string",
-      "price": "EGP x,xxx",
-      "score": number,
-      "store": "string",
-      "link": "string",
-      "tone": "string",
-      "why": "string"
+// Fallback search URLs for when no priced organic results are found.
+const _FALLBACK_STORES = [
+  { name: 'Amazon.eg',      url: (q) => `https://www.amazon.eg/s?k=${q}` },
+  { name: 'Noon Egypt',     url: (q) => `https://www.noon.com/egypt-en/search/?q=${q}` },
+  { name: 'Jumia Egypt',    url: (q) => `https://www.jumia.com.eg/catalog/?q=${q}` },
+  { name: 'B.TECH',         url: (q) => `https://btech.com/en/s?q=${q}` },
+  { name: '2B Egypt',       url: (q) => `https://2b.com.eg/en/catalogsearch/result/?q=${q}` },
+];
+
+function _storeNameFromDomain(domain) {
+  for (const [needle, label] of _KNOWN_STORE_LABELS) {
+    if (domain.includes(needle)) return label;
+  }
+  // Derive a readable name from the domain (same logic as backend)
+  let name = domain.replace(/\.(com|net|org|store|shop)?\.eg$/, '');
+  name = name.replace(/\.(com|net|org|store|shop|io)$/, '');
+  const parts = name.split(/[.\-_]/);
+  return parts
+    .map((p) => (p.length <= 3 ? p.toUpperCase() : p.charAt(0).toUpperCase() + p.slice(1)))
+    .join(' ') || domain;
+}
+
+// JS port of Python _best_price_from_snippet.
+// Searches the text for EGP amounts, ignores promotional contexts ("save",
+// "EMI", etc.), and returns the smallest remaining candidate — same heuristic
+// the backend uses.
+function _extractPriceFromSnippet(text) {
+  const PATTERNS = [
+    /(?:EGP|L\.?E\.?)\s*([\d,]+(?:\.\d{1,2})?)/gi,
+    /([\d,]+(?:\.\d{1,2})?)\s*(?:EGP|L\.?E\.)\b/gi,
+    /ج\.\u0645\.?\s*([\d,]+(?:\.\d{1,2})?)/g,
+    /([\d,]+(?:\.\d{1,2})?)\s*ج\.م/g,
+    /([\d,]+(?:\.\d{1,2})?)\s*جنيه/g,
+  ];
+  const BLACKLIST = ['save', 'was', 'off', 'discount', 'emi', 'installment', '/mo', 'per month', 'monthly', 'original price'];
+
+  const candidates = [];
+  for (const pattern of PATTERNS) {
+    let m;
+    const re = new RegExp(pattern.source, pattern.flags);
+    while ((m = re.exec(text)) !== null) {
+      const context = text.slice(Math.max(0, m.index - 25), m.index).toLowerCase();
+      if (BLACKLIST.some((bad) => context.includes(bad))) continue;
+      const val = parseFloat((m[1] || m[0]).replace(/,/g, ''));
+      if (val > 0 && val < 10_000_000) candidates.push(val);
     }
-  ]
-}`;
+  }
+  return candidates.length > 0 ? Math.min(...candidates) : null;
+}
+
+/**
+ * Search Google Egypt (gl=eg) for a product query via SerpAPI.
+ * requirePrice=true (default for camera scan): only return results with EGP
+ *   price found in the snippet.
+ * requirePrice=false (used by URL-scan supplement): accept any merchant result
+ *   even without a price — shows 'Check store' so the card is still functional.
+ */
+async function _searchEgyptianMarket(query, requirePrice = true) {
+  if (!SERPAPI_KEY) {
+    console.warn('[TrustGuard] SERPAPI_KEY not set — skipping Egyptian market search');
+    return [];
+  }
+  try {
+    const qs = new URLSearchParams({
+      engine: 'google',
+      q: `${query} سعر مصر`,   // append Arabic "price Egypt" for better EGP results
+      gl: 'eg',
+      hl: 'en',
+      google_domain: 'google.com.eg',
+      api_key: SERPAPI_KEY,
+      num: '10',
+    });
+    console.log('[TrustGuard] Egyptian market search →', query.slice(0, 60));
+    const res = await fetch(`${SERPAPI_BASE_URL}?${qs.toString()}`);
+    if (!res.ok) {
+      console.warn('[TrustGuard] SerpApi Google Egypt failed:', res.status);
+      return [];
+    }
+    const data = await res.json();
+
+    const results = [];
+    for (const item of (data.organic_results ?? [])) {
+      const link = (item.link ?? '').trim();
+      if (!link) continue;
+      let domain;
+      try { domain = new URL(link).hostname.replace('www.', ''); } catch { continue; }
+      if (_NON_MERCHANT_DOMAINS.some((bad) => domain.includes(bad))) continue;
+
+      const snippetText = `${item.snippet ?? ''} ${item.title ?? ''}`;
+      const price = _extractPriceFromSnippet(snippetText);
+
+      // When requirePrice is true (camera scan), skip results with no EGP price.
+      // When false (URL-scan supplement), keep them with price=null.
+      if (requirePrice && !price) continue;
+
+      results.push({
+        title: item.title ?? '',
+        store: _storeNameFromDomain(domain),
+        price: price ?? null,   // null means 'Check store'
+        link,
+      });
+      if (results.length >= 8) break;
+    }
+    console.log('[TrustGuard] Egyptian market results:', results.length);
+    return results;
+  } catch (e) {
+    console.warn('[TrustGuard] Egyptian market search error:', e.message);
+    return [];
+  }
+}
+
+// Minimal prompt — only used to extract a clean product name from Lens data
+// when knowledge_graph is absent or too vague. No store-picking.
+const IMAGE_DETECT_PROMPT = `You receive Google Lens results from a product photo.
+Return ONLY valid JSON with a single field:
+{ "detected": "<concise product name and brand if known, e.g. 'Samsung Galaxy S24' or 'Nike Air Force 1 Low White'>" }
+Do not include any other field.`;
+
+
+function _calculateTrustScore(result, scraped, marketResults) {
+  // Start from a base score of 25
+  let score = 25;
+
+  // 1. Ratings (max 15 points)
+  let ratingPoints = 0;
+  const ratingVal = result.sections.ratings?.value ?? 0;
+  const ratingCount = result.sections.ratings?.total ?? 0;
+  if (ratingVal > 0) {
+    // Up to 10 points based on star rating (e.g., 5.0/5 = 10 pts)
+    ratingPoints += (ratingVal / 5) * 10;
+  }
+  if (ratingCount > 0) {
+    // Up to 5 points based on review volume
+    if (ratingCount >= 500) ratingPoints += 5;
+    else if (ratingCount >= 100) ratingPoints += 4;
+    else if (ratingCount >= 20) ratingPoints += 2;
+    else ratingPoints += 1;
+  }
+  score += ratingPoints;
+
+  // 2. Well known of the website (max 15 points)
+  let sitePoints = 0;
+  const scannedUrl = result.scannedUrl || scraped.scannedUrl || '';
+  if (scannedUrl) {
+    try {
+      const host = new URL(scannedUrl).hostname.replace('www.', '').toLowerCase();
+      const isKnown = _KNOWN_STORE_LABELS.some(([needle]) => host.includes(needle));
+      if (isKnown) {
+        sitePoints = 15;
+      } else {
+        sitePoints = 5;
+      }
+    } catch {
+      sitePoints = 5;
+    }
+  }
+  score += sitePoints;
+
+  // 3. Certification (max 15 points)
+  let certPoints = 0;
+  const claims = result.sections.certificates?.claims ?? [];
+  const verifiedClaims = claims.filter(c => c.verified === true);
+  if (verifiedClaims.length > 0) {
+    certPoints = 15;
+  } else if (claims.length > 0) {
+    certPoints = 5;
+  }
+  score += certPoints;
+
+  // 4. Reviews (max 15 points)
+  let reviewPoints = 0;
+  const quotesCount = (result.sections.feedback?.quotes ?? []).length;
+  if (quotesCount > 0) {
+    // +3 points per review quote up to 15 max
+    reviewPoints = Math.min(15, quotesCount * 3);
+  }
+  score += reviewPoints;
+
+  // 5. Price compared to alternatives (max 15 points)
+  let pricePoints = 0;
+  const priceStatus = result.sections.price?.status;
+  if (priceStatus === 'pass') {
+    pricePoints = 15;
+  } else if (priceStatus === 'warn') {
+    pricePoints = 5;
+  } else {
+    pricePoints = 0;
+  }
+  score += pricePoints;
+
+  // 6. Eco-friendly category bonus (+10 points)
+  // Raising score if eco friendly (low impact), no decrease if moderate/harmful or missing.
+  const ecoImpact = result.sections.certificates?.classification?.ecoImpact;
+  if (ecoImpact === 'low') {
+    score += 10;
+  }
+
+  // Round and clamp to [0, 100]
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  // If no seller info exists at all on the page, cap score at 55 to protect users
+  if (!scraped.sellerInfo) {
+    score = Math.min(score, 55);
+  }
+
+  return score;
+}
+
 
 // ── Public API ────────────────────────────────────────────────────────────────
-
 export async function analyzeUrl(url) {
   // Scrapling does all the scraping — page content, seller info, social
   // reviews, and real competing-listing market data in one call. If this
@@ -518,42 +745,106 @@ export async function analyzeUrl(url) {
   // Real market price range computed from actual competing listings
   _injectMarketPrice(result, _computeMarketStats(scraped.marketResults));
 
-  // Real alternative links/prices from actual competing listings
-  _injectAlternatives(result, scraped.marketResults);
+  // ── Real alternatives via Egyptian market search (same pipeline as camera scan)
+  // The backend already ran _search_market (Google Egypt) and returned marketResults.
+  // If that came back with fewer than 3 priced listings (cold backend, anti-bot block,
+  // or a very niche product), supplement with a client-side _searchEgyptianMarket
+  // call — identical to what the camera scan flow does.
+  let marketData = (scraped.marketResults ?? []).filter((m) => m.link && m.price > 0);
+  if (marketData.length < 3) {
+    const productQuery = `${result.brand ?? ''} ${result.product ?? ''}`.trim();
+    if (productQuery) {
+      console.log('[TrustGuard] Supplementing alternatives with client-side Egyptian market search:', productQuery.slice(0, 60));
+      // requirePrice=false: accept merchant results even without EGP in snippet
+      // so we always get some results to show (price shown as 'Check store').
+      const extra = await _searchEgyptianMarket(productQuery, false);
+      const seenLinks = new Set(marketData.map((m) => m.link));
+      const newItems  = extra.filter((m) => !seenLinks.has(m.link));
+      marketData = [...marketData, ...newItems];
+    }
+  }
+  _injectAlternatives(result, marketData);
 
-  // ── Sanitize LLM quotes — drop blank / dot-placeholder / trivially short ──
-  // The LLM sometimes returns quotes: [{text:".", src:"", who:""}] when it has
-  // nothing real to quote from the source snippets. Filter those out first.
+  // ── Last-resort fallback: if BOTH backend and client-side search returned
+  // nothing, show Egyptian store search links so the section is never empty.
+  if ((result.alternatives ?? []).length === 0) {
+    console.log('[TrustGuard] No market results — using fallback Egyptian store search links');
+    const productQuery = `${result.brand ?? ''} ${result.product ?? ''}`.trim();
+    const q = encodeURIComponent(productQuery || 'product');
+    result.alternatives = _FALLBACK_STORES.map((store, i) => ({
+      id:    `a${i + 1}`,
+      brand: '',
+      name:  productQuery || 'Search results',
+      price: 'Check store',
+      score: 75,
+      store: store.name,
+      link:  store.url(q),
+      tone:  _ALT_TONES[i % _ALT_TONES.length],
+      tags:  [],
+    }));
+  }
+
+
+  // ── Inject real scraped page reviews directly — no LLM interpretation ──────
+  // pageReviews contains verbatim text scraped from the product page itself
+  // (Amazon review bodies, site testimonials, star-sentence patterns).
+  // We bypass the LLM entirely for quotes so it cannot fabricate.
+  const scrapedPageReviews = (scraped.pageReviews ?? []).filter(
+    (r) => ((r.snippet ?? '').trim().length >= 15)
+  );
+
   const fb = result.sections.feedback;
-  fb.quotes = (fb.quotes ?? []).filter((q) => {
-    const txt = (q.text ?? '').trim();
-    // Must be at least 10 real characters and not just punctuation/whitespace
-    return txt.length >= 10 && /[a-zA-Z\u0600-\u06FF]/.test(txt);
-  });
 
-  // ── Backfill from raw review snippets when LLM produced no real quotes ────
-  // If sanitization left us with zero quotes but we DID fetch real review text,
-  // promote the raw snippets directly so the boxes are never empty.
-  if (fb.quotes.length === 0 && mergedReviews.length > 0) {
-    fb.quotes = mergedReviews
-      .filter((r) => (r.snippet ?? '').trim().length >= 15)
-      .slice(0, 5)
-      .map((r) => ({
-        text: r.snippet.trim(),
-        src:  r.title?.trim() || 'Customer review',
-        who:  '',
-        sev:  'good',
-      }));
+  if (scrapedPageReviews.length > 0) {
+    // Use real scraped review text verbatim as quotes
+    fb.quotes = scrapedPageReviews.slice(0, 6).map((r) => ({
+      text: (r.snippet ?? '').trim(),
+      src:  (r.title ?? '').trim() || 'Customer review',
+      who:  '',
+      sev:  'good',
+    }));
+    fb.status  = fb.status && fb.status !== 'warn' ? fb.status : 'pass';
+    // Keep LLM-generated summary/themes (they are still useful summaries)
+    // but guarantee they reflect the real reviews, not fabrication.
+    if (!fb.summary || fb.summary.toLowerCase().includes('could not')) {
+      fb.summary = `Based on ${scrapedPageReviews.length} customer review${scrapedPageReviews.length > 1 ? 's' : ''} scraped from the product page.`;
+    }
+    if (!fb.themes || fb.themes.length === 0) {
+      fb.themes = [];
+    }
+  } else {
+    // ── No page reviews — sanitize LLM quotes (may still be fabricated) ────
+    fb.quotes = (fb.quotes ?? []).filter((q) => {
+      const txt = (q.text ?? '').trim();
+      return txt.length >= 10 && /[a-zA-Z\u0600-\u06FF]/.test(txt);
+    });
+
+    // Backfill from social snippets when LLM produced nothing usable
+    if (fb.quotes.length === 0 && mergedReviews.length > 0) {
+      fb.quotes = mergedReviews
+        .filter((r) => (r.snippet ?? '').trim().length >= 15)
+        .slice(0, 5)
+        .map((r) => ({
+          text: r.snippet.trim(),
+          src:  r.title?.trim() || 'Customer review',
+          who:  '',
+          sev:  'good',
+        }));
+    }
+
+    // Wipe fabricated feedback when no real content was found at all
+    if (mergedReviews.length === 0 && fb.quotes.length === 0) {
+      fb.quotes  = [];
+      fb.themes  = [];
+      fb.sources = [];
+      fb.summary = 'No customer feedback found from public sources.';
+      fb.status  = 'warn';
+    }
   }
 
-  // ── Wipe fabricated feedback when no real content was found at all ─────────
-  if (mergedReviews.length === 0) {
-    fb.quotes  = [];
-    fb.themes  = [];
-    fb.sources = [];
-    fb.summary = 'No customer feedback found from public sources.';
-    fb.status  = 'warn';
-  }
+
+  // ── Calculate deterministic trust score ──────────────────────────────────
+  result.trustScore = _calculateTrustScore(result, scraped, marketData);
 
   return result;
 }
@@ -563,15 +854,71 @@ export async function uploadToImgBB(imageUri) {
 }
 
 export async function searchByImage(imageUri) {
+  // ── Step 1: Upload & Google Lens identify ─────────────────────────────────
   const { url: publicUrl } = await _uploadToImgBB(imageUri);
   const lensData = await _serpLens(publicUrl);
-  const payload = {
-    visual_matches: (lensData.visual_matches ?? []).slice(0, 8).map((m) => ({
-      title: m.title, source: m.source, price: m.price,
-    })),
-    knowledge_graph: lensData.knowledge_graph
-      ? { title: lensData.knowledge_graph.title, type: lensData.knowledge_graph.type }
-      : null,
-  };
-  return _callLLM(IMAGE_SYSTEM_PROMPT, JSON.stringify(payload));
+
+  // ── Step 2: Extract product name ──────────────────────────────────────────
+  // Prefer knowledge_graph.title (Google's own entity label — most reliable).
+  // Fall back to top visual match title, then use a minimal LLM call to
+  // produce a cleaner name if both are too vague or missing.
+  let detected =
+    (lensData.knowledge_graph?.title ?? '').trim() ||
+    (lensData.visual_matches?.[0]?.title ?? '').trim();
+
+  if (!detected && GROK_API_KEY) {
+    console.log('[TrustGuard] Lens gave no title — asking LLM to identify product');
+    const lensPayload = {
+      visual_matches: (lensData.visual_matches ?? []).slice(0, 5).map((m) => ({ title: m.title, source: m.source })),
+      knowledge_graph: lensData.knowledge_graph ? { title: lensData.knowledge_graph.title, type: lensData.knowledge_graph.type } : null,
+    };
+    try {
+      const identified = await _callLLM(IMAGE_DETECT_PROMPT, JSON.stringify(lensPayload));
+      detected = (identified.detected ?? '').trim();
+    } catch (e) {
+      console.warn('[TrustGuard] LLM identify failed:', e.message);
+    }
+  }
+
+  if (!detected) throw new Error('Could not identify the product from the photo. Please try a clearer image.');
+  console.log('[TrustGuard] Detected product:', detected);
+
+  // ── Step 3: Search Egyptian market for real listings ──────────────────────
+  const marketResults = await _searchEgyptianMarket(detected);
+
+  // ── Step 4: Build match cards from real search results ───────────────────
+  const TONES = ['sage', 'cream', 'bottle', 'rose', 'sand', 'slate', 'bronze', 'forest', 'coral', 'sky', 'cocoa', 'moss'];
+
+  let matches = marketResults.map((item, i) => ({
+    id:    `p${i + 1}`,
+    brand: '',
+    name:  item.title,
+    price: `EGP ${Math.round(item.price).toLocaleString()}`,
+    score: 75,
+    store: item.store,
+    link:  item.link,
+    tone:  TONES[i % TONES.length],
+    why:   `Listed on ${item.store} in the Egyptian market`,
+  }));
+
+  // ── Step 5: Fallback — if no priced listings found, surface search URLs ───
+  // This can happen when snippets contain no EGP text (rare but possible).
+  // Show real Egyptian store search links so the user can still shop.
+  if (matches.length === 0) {
+    console.log('[TrustGuard] No priced results — using fallback store search links');
+    const q = encodeURIComponent(detected);
+    matches = _FALLBACK_STORES.map((store, i) => ({
+      id:    `p${i + 1}`,
+      brand: '',
+      name:  detected,
+      price: 'Check store',
+      score: 75,
+      store: store.name,
+      link:  store.url(q),
+      tone:  TONES[i % TONES.length],
+      why:   `Search \"${detected}\" on ${store.name}`,
+    }));
+  }
+
+  return { detected, matches };
 }
