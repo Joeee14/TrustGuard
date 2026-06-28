@@ -43,7 +43,7 @@ _DDG_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
+SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '') or os.environ.get('EXPO_PUBLIC_SERPAPI_KEY', '')
 SERPAPI_URL = 'https://serpapi.com/search.json'
 
 
